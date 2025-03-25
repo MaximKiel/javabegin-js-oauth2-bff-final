@@ -5,16 +5,35 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.configurationprocessor.json.JSONException;
+import org.springframework.boot.configurationprocessor.json.JSONObject;
 import org.springframework.http.*;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.util.UriComponentsBuilder;
+import ru.javabegin.oauth2.backend.dto.DataResult;
+import ru.javabegin.oauth2.backend.dto.SearchValues;
+import ru.javabegin.oauth2.backend.dto.UserProfile;
 import ru.javabegin.oauth2.backend.utils.CookieUtils;
 
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
+
+/*
+Адаптер между frontend и resource server - перенаправляет запросы между ними
+Основная задача - сохранять токены в безопасных куках
+
+Сокращения:
+AT - access token
+RT - refresh token
+IT - id token
+RS - resource server
+KC - keycloak
+
+ */
 
 @RestController
 @RequestMapping("/bff") // базовый URI
@@ -23,9 +42,12 @@ public class BFFController {
     // можно также использовать WebClient вместо RestTemplate, если нужны асинхронные запросы
     private static final RestTemplate restTemplate = new RestTemplate(); // для выполнения веб запросов на KeyCloak
 
+    // ключи для названий куков
     public static final String IDTOKEN_COOKIE_KEY = "IT";
     public static final String REFRESHTOKEN_COOKIE_KEY = "RT";
     public static final String ACCESSTOKEN_COOKIE_KEY = "AT";
+
+    // значения из настроек (значения внедряются автоматически)
     @Value("${keycloak.secret}")
     private String clientSecret;
 
@@ -34,7 +56,6 @@ public class BFFController {
 
     @Value("${keycloak.url}")
     private String keyCloakURI;
-
 
     @Value("${client.url}")
     private String clientURL;
@@ -48,38 +69,60 @@ public class BFFController {
     @Value("${keycloak.granttype.refresh}")
     private String grantTypeRefresh;
 
-    private final CookieUtils cookieUtils; // класс-утилита для работы с куками
+    // класс-утилита для работы с куками
+    private final CookieUtils cookieUtils;
+
+    // значения куков
+    private int accessTokenDuration;
+    private int refreshTokenDuration;
+
+    private String accessToken;
+    private String idToken;
+    private String refreshToken;
+
+    // используется, чтобы получать любые значения пользователя из JSON
+    private JSONObject payload;
+
+    // идентификатор пользователя из KC, может использоваться для поиска
+    private String userId;
+
 
     @Autowired
-    public BFFController(CookieUtils cookieUtils) {
+    public BFFController(CookieUtils cookieUtils) { // внедряем объекты
         this.cookieUtils = cookieUtils;
     }
 
 
-    // просто перенаправляет запрос в Resource Server и добавляет в него access token
-    @GetMapping("/data")
-    public ResponseEntity<String> data(@CookieValue("AT") String accessToken) {
+    // перенаправляет запрос в Resource Server и добавляет в него access token
+    @PostMapping("/data")
+    public ResponseEntity<DataResult> data(@RequestBody SearchValues searchValues, @CookieValue("AT") String accessToken) {
 
-        // обязательно нужно добавить заголовок авторизации с access token
+        // как пример - сюда можно передавать любые критерии поиска
+        System.out.println("searchText = " + searchValues.getSearchText());
+
+        // заголовок авторизации с access token
         HttpHeaders headers = new HttpHeaders();
         headers.setBearerAuth(accessToken); // слово Bearer будет добавлено автоматически
+        headers.setContentType(MediaType.APPLICATION_JSON); // чтобы передать searchValues в формате JSON
 
-        HttpEntity<MultiValueMap<String, String>> request = new HttpEntity<>(headers);
+        // специальный контейнер для передачи объекта внутри запроса
+        HttpEntity<SearchValues> request = new HttpEntity<>(searchValues, headers);
 
-        ResponseEntity<String> response = restTemplate.exchange(resourceServerURL+ "/user/data", HttpMethod.GET, request, String.class);
+        // получение бизнес-данных пользователя (ответ обернется в DataResult)
+        ResponseEntity<DataResult> response = restTemplate.postForEntity(resourceServerURL + "/user/data", request, DataResult.class);
 
         return response;
     }
 
 
-    // получение новых токенов на основе старого RefreshToken
-    @GetMapping("/newaccesstoken")
-    public ResponseEntity<String> newAccessToken(@CookieValue("RT") String oldRefreshToken) {
+    // получение новых токенов на основе старого RT
+    @GetMapping("/exchange")
+    public ResponseEntity<String> exchangeRefreshToken(@CookieValue("RT") String oldRefreshToken) {
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
 
-        // параметры запроса
+        // параметры запроса (в формате ключ-значение)
         MultiValueMap<String, String> mapForm = new LinkedMultiValueMap<>();
         mapForm.add("grant_type", grantTypeRefresh);
         mapForm.add("client_id", clientId);
@@ -92,22 +135,36 @@ public class BFFController {
         // выполняем запрос (можно применять разные методы, не только exchange)
         ResponseEntity<String> response = restTemplate.exchange(keyCloakURI + "/token", HttpMethod.POST, request, String.class);
 
-        try {
 
-            // создаем куки для ответа в браузер
-            HttpHeaders responseHeaders = createCookies(response);
+        // создаем куки для их записи в браузер (frontend)
+        HttpHeaders responseHeaders = createCookies();
 
-            // отправляем клиенту ответ со всеми куками (которые запишутся в браузер автоматически)
-            // значения куков с новыми токенами перезапишутся в браузер
-            return ResponseEntity.ok().headers(responseHeaders).build();
+        // отправляем клиенту ответ со всеми куками (которые запишутся в браузер автоматически)
+        // значения куков с новыми токенами перезапишутся в браузер
+        return ResponseEntity.ok().headers(responseHeaders).build();
 
-        } catch (JsonProcessingException e) {
-            e.printStackTrace();
 
-        }
+    }
 
-        // если ранее где-то возникла ошибка, то код переместится сюда, поэтому возвращаем статус с ошибкой
-        return ResponseEntity.badRequest().build();
+
+    // получение подробных данных пользователя (профайл)
+    // все данные берем из ранее полученного idToken
+    // запроса в RS не делаем, т.к. бизнес-данные тут не запрашиваются
+    @GetMapping("/profile")
+    public ResponseEntity<UserProfile> profile() {
+
+        userId = getPayloadValue("sid");
+
+        UserProfile userProfile = new UserProfile(
+                getPayloadValue("given_name"),
+                getPayloadValue("family_name"),
+                getPayloadValue("address"),
+                getPayloadValue("email"),
+                userId
+        );
+
+        return ResponseEntity.ok(userProfile);
+
     }
 
 
@@ -132,31 +189,25 @@ public class BFFController {
         params.put("id_token_hint", idToken); // idToken указывает Auth Server, для кого мы хотим "выйти"
         params.put("client_id", clientId);
 
-        // выполняем запрос
-        ResponseEntity<String> response = restTemplate.getForEntity(
-                urlTemplate, // шаблон GET запроса
+        // выполняем запрос (результат нам не нужен)
+        restTemplate.getForEntity(
+                urlTemplate, // шаблон GET запроса - туда будут подставляться значения из params
                 String.class, // нам ничего не возвращается в ответе, только статус, поэтому можно указать String
                 params // какие значения будут подставлены в шаблон GET запроса
         );
 
 
-        // если KeyCloak вернул 200-ОК, значит сессии пользователя успешно закрыты и можно обнулять куки
-        if (response.getStatusCode() == HttpStatus.OK) {
+        // занулить значения и сроки годности всех куков (тогда браузер их удалит автоматически)
+        HttpHeaders responseHeaders = clearCookies();
 
-            // занулить значения и сроки годности всех куков (тогда браузер их удалит автоматически)
-            HttpHeaders responseHeaders = clearCookies();
-
-            // отправляем клиенту ответ с куками, которые автоматически применятся к браузеру
-            return ResponseEntity.ok().headers(responseHeaders).build();
-        }
-
-        return ResponseEntity.badRequest().build();
+        // отправляем браузеру ответ с пустыми куками для их удаления (зануления), т.к. пользователь вышел из системы
+        return ResponseEntity.ok().headers(responseHeaders).build();
 
     }
 
 
-    // получение access token от лица клиента
-    // но сами токены сохраняться в браузере не будут, а только будут передаваться в куках
+    // получение всех токенов и запись в куки
+    // сами токены сохраняться в браузере не будут, а только будут передаваться в куках
     // таким образом к ним не будет доступа из кода браузера (защита от XSS атак)
     @PostMapping("/token")
     public ResponseEntity<String> token(@RequestBody String code) {// получаем auth code, чтобы обменять его на токены
@@ -172,7 +223,7 @@ public class BFFController {
         MultiValueMap<String, String> mapForm = new LinkedMultiValueMap<>();
         mapForm.add("grant_type", grantTypeCode);
         mapForm.add("client_id", clientId);
-        mapForm.add("client_secret", clientSecret);
+        mapForm.add("client_secret", clientSecret); // используем статичный секрет (можем его хранить безопасно), вместо code verifier из PKCE
         mapForm.add("code", code);
 
         // В случае работы клиента через BFF - этот redirect_uri может быть любым, т.к. мы не открываем окно вручную, а значит не будет автоматического перехода в redirect_uri
@@ -188,44 +239,59 @@ public class BFFController {
         ResponseEntity<String> response = restTemplate.exchange(keyCloakURI + "/token", HttpMethod.POST, request, String.class);
         // мы получаем JSON в виде текста
 
+        parseResponse(response); // получить все нужные поля ответа KC
 
-        try {
+        // считать данные из JSON и записать в куки
+        HttpHeaders responseHeaders = createCookies();
 
-            // считать данные из JSON и записать в куки
-            HttpHeaders responseHeaders = createCookies(response);
+        // отправляем клиенту данные пользователя (и jwt-кук в заголовке Set-Cookie)
+        return ResponseEntity.ok().headers(responseHeaders).build();
 
-            // отправляем клиенту данные пользователя (и jwt-кук в заголовке Set-Cookie)
-            return ResponseEntity.ok().headers(responseHeaders).build();
-
-
-        } catch (JsonProcessingException e) {
-            e.printStackTrace();
-
-        }
-
-        // если ранее где-то возникла ошибка, то код переместится сюда, поэтому возвращаем статус с ошибкой
-        return ResponseEntity.badRequest().build();
 
     }
 
-    // создание куков для response
-    private HttpHeaders createCookies(ResponseEntity<String> response) throws JsonProcessingException {
+    // получить любое значение claim из payload
+    private String getPayloadValue(String claim) {
+        try {
+            return payload.getString(claim);
+        } catch (JSONException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    // получение нужных полей из ответа KC
+    private void parseResponse(ResponseEntity<String> response) {
 
         // парсер JSON
         ObjectMapper mapper = new ObjectMapper();
 
         // сначала нужно получить корневой элемент JSON
-        JsonNode root = mapper.readTree(response.getBody());
+        try {
+            JsonNode root = mapper.readTree(response.getBody());
 
-        // получаем значения токенов из корневого элемента JSON
-        String accessToken = root.get("access_token").asText();
-        String idToken = root.get("id_token").asText();
-        String refreshToken = root.get("refresh_token").asText();
+            // получаем значения токенов из корневого элемента JSON в формате Base64
+            accessToken = root.get("access_token").asText();
+            idToken = root.get("id_token").asText();
+            refreshToken = root.get("refresh_token").asText();
 
-        // Сроки действия для токенов берем также из JSON
-        // Куки станут неактивные в то же время, как выйдет срок действия токенов в KeyCloak
-        int accessTokenDuration = root.get("expires_in").asInt();
-        int refreshTokenDuration = root.get("refresh_expires_in").asInt();
+            // Сроки действия для токенов берем также из JSON
+            // Куки станут неактивные в то же время, как выйдет срок действия токенов в KeyCloak
+            accessTokenDuration = root.get("expires_in").asInt();
+            refreshTokenDuration = root.get("refresh_expires_in").asInt();
+
+            // все данные пользователя (профайл)
+            String payloadPart = idToken.split("\\.")[1]; // берем значение раздела payload в формате Base64
+            String payloadStr = new String(Base64.getUrlDecoder().decode(payloadPart)); // декодируем из Base64 в обычный текст JSON
+            payload = new JSONObject(payloadStr); // формируем удобный формат JSON - из него теперь можно получать любе поля
+
+        } catch (JsonProcessingException | JSONException e) {
+            throw new RuntimeException(e);
+        }
+
+    }
+
+    // создание куков для response
+    private HttpHeaders createCookies() {
 
         // создаем куки, которые браузер будет отправлять автоматически на BFF при каждом запросе
         HttpCookie accessTokenCookie = cookieUtils.createCookie(ACCESSTOKEN_COOKIE_KEY, accessToken, accessTokenDuration);
@@ -256,7 +322,4 @@ public class BFFController {
         responseHeaders.add(HttpHeaders.SET_COOKIE, idTokenCookie.toString());
         return responseHeaders;
     }
-
-
 }
-
